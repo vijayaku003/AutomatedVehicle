@@ -1,0 +1,1564 @@
+//#include "sys_pmu.h"
+#include "sys_common.h"
+#include "system.h"
+#include "stdint.h"
+#include "os_projdefs.h"
+#include "can.h"
+#include "esm.h"
+#include "sci.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include "sys_core.h"
+#include "sys_vim.h"
+
+/* Include FreeRTOS scheduler files */
+#include "FreeRTOS.h"
+#include "os_task.h"
+#include "os_semphr.h"
+#include "os_portmacro.h"
+
+/* Include HET header file - types, definitions and function declarations for system driver */
+#include "het.h"
+#include "gio.h"
+
+/* Define Task Handles */
+xTaskHandle canTaskTcb;
+
+
+xTaskHandle CAWarningTaskTcb;
+xTaskHandle CATcb;
+
+xTaskHandle uartUltrasonicTaskTcb;
+xTaskHandle ultrasonicTaskTcb;
+
+xTaskHandle radarTaskTcb;
+xTaskHandle vehToVehTaskTcb;
+
+xTaskHandle laneChangePilotTcb;
+xTaskHandle hillAssistTcb;
+
+xTaskHandle CANPeriodicTxTaskTcb;
+
+
+int *intvectreg = (int *) 0xFFFFFE70;
+int *intindexreg = (int *) 0xFFFFFE00;
+
+#define LOW  		0
+#define HIGH 		1
+#define DATA_LEN	8
+
+#define LED_TASK 0
+
+#define UART_ABS scilinREG //Tx ABS data
+#define UART_STEER sciREG //Tx steering data
+#define UART_STACK_SIZE	  ( ( unsigned portSHORT ) 256 )
+
+//#define f_HCLK (float) 180.0 // f in [MHz]; HCLK (depends on device setup)
+
+
+
+//uint8_t statsBuffer[40*5]; // Enough space for 5 tasks - this needs to be global, since task stack is too small
+
+/*---------------Mode/Scenario/ResourceShortage Change Flags----------------------*/
+
+// Resource Shortage Type Flags
+
+static float overrunState0=0; //  Radar Overrun
+static float overrunState1=0; //  CAN Overrun
+
+// Mode Change Flags
+static float straightRoadFlag=0;
+static float curveRoadFlag=0;
+static float hillFlag=0;
+
+static float laneChangeFlag=0;
+
+static int radarDisableFlag=0;
+static int radarDegradeFlag =0;
+static int V2VDisableFlag=0;
+static int V2VDegradeFlag=0;
+
+uint8 rx_str_data[5];
+uint8 rx_data[DATA_LEN];
+char rxMbox1[5];
+char rxMbox2[5];
+int rxIntMbox1;
+
+SemaphoreHandle_t canIntRxSem;
+SemaphoreHandle_t accSem;
+SemaphoreHandle_t ultrasonicSem;
+SemaphoreHandle_t uartAccTxSem;
+SemaphoreHandle_t uartUltrasonicTxSem;
+SemaphoreHandle_t radarSem;
+SemaphoreHandle_t radarSem;
+SemaphoreHandle_t vehToVehSem;
+
+uint32 mailBox;
+
+/* Runtime Utilization for Radar, V2V, CAN, Collision Avoidance, Collision Warning, Steering Control tasks */
+float RadarUtil=0;
+float V2VUtil=0;
+float CANUtil=0;
+float CAUtil=0;
+float CAWarningUtil=0;
+float SteerUtil=0;
+
+/* Start and Stop Times for Execution Time Measurement */
+
+volatile TickType_t CANstartTime = 0;
+volatile TickType_t CANstopTime = 0;
+volatile TickType_t RadarstartTime = 0;
+volatile TickType_t RadarstopTime = 0;
+volatile TickType_t V2VstartTime = 0;
+volatile TickType_t V2VstopTime = 0;
+volatile TickType_t CAstartTime = 0;
+volatile TickType_t CAstopTime = 0;
+volatile TickType_t CAWarningstartTime = 0;
+volatile TickType_t CAWarningstopTime = 0;
+
+
+void delay_ms(unsigned int  delay);
+int calculateWheelSlip(int *wheelSpin);
+int calculateSteerSensitivity(int pubSpeed);
+
+//MATLAB Applications
+void send_float (float arg);
+float numericalDerivativeDist(float dist);
+float accelerationDemand(float dist, float follower_velX, float headway);
+float accelerationDemand2(float dist, float follower_velX, float leader_velX, float headway);
+void simpleThrottleBrake(float dist, float follower_velX, float leader_velX, float headway);
+float calculateEuclidianDistance(float follower_pos[3], float leader_pos[3]);
+int checkFieldOfView(float follower_pos[3], float leader_pos[3], float dist);
+float numericalDerivativeKP(float kp);
+float numericalDerivativeKD(float kd);
+float steering (float angular_vel, float headingError, float lateralError);
+void accelerationControl(float accelDemand, float follower_accelX);
+void accelerationControlVeh(float accelDemand, float follower_accelX);
+double int_simpson(double from, double to, double n, double m, double c);
+
+//MATLAB Variables
+//Inputs
+#define highCrit 1
+float prevTime, currentTime;
+float timeStep;
+static float lead_pos[3], fol_pos[3], lead_pos_delayed[3];
+//static float lead_pos_x, lead_pos_y, lead_pos_z, fol_pos_x, fol_pos_y, fol_pos_z;
+static float fol_vel, lead_vel, lead_vel_delayed;
+static float fol_ang_vel_z, fol_head_error, fol_lat_error, fol_acc_x, fol_yaw, dummy;
+static uint32 ans,ans2;
+//outputs
+static int vehicleAhead;
+static float distApartVV, distApartRadar, accelDemand;
+static float throttle, brake, steer;
+static float gear=0;
+//Ultrasonic Variables
+static int ultrasonic_dist;
+
+//Test Variables
+static float throttleRecord[200], accelRecord[200];
+static float float_buffer[100] = {0};
+static uint8 int_buffer[100] = {0};
+//static uint8 test_data[4]={255,255,255,255};
+
+//timing variables
+static TickType_t BudgetAvg = 0;
+static TickType_t Budget = 0;
+static TickType_t CANexecutionTime [1000];
+static TickType_t distexecutionTime [1000];
+static TickType_t radarExecutionTime [1000];
+static TickType_t ultrasonicExecutionTime [1000];
+static TickType_t uartUltrasonicexecutionTime [1000];
+static TickType_t UARTABSexecutionTime [1000];
+static TickType_t laneChangeCount;
+
+
+static TickType_t radarStart=0;
+static TickType_t radarStop=0;
+static TickType_t CANStart=0;
+static TickType_t CANStop=0;
+static TickType_t V2VStart=0;
+static TickType_t V2VStop=0;
+
+
+
+
+
+inline void sciDisplayText(sciBASE_t *sci, uint8 *text,uint32 length)
+{
+	while(length--)
+    {
+        while ((sci->FLR & 0x4) == 4); /* wait until busy */
+        sciSendByte(sci,*text++);      /* send out text   */
+    };
+}
+
+
+
+
+
+/* Task1 */
+void canTask(void *pvParameters)
+{
+	//for periodicity
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+
+/*	volatile TickType_t CANwaitTime = 0;
+	volatile TickType_t CANstartTime = 0;
+	volatile TickType_t CANstopTime = 0;
+	volatile TickType_t CANexecutionTime [500];
+*/
+
+	static int i = 0;
+//	stepCount++;
+
+	//prevTime = xTaskGetTickCount ();
+
+	while (1)
+	{
+		vTaskDelayUntil(&xLastWakeTime, 10); //0.1ms
+
+		if(xSemaphoreTake(canIntRxSem, 0) == pdTRUE)
+		{
+
+
+		//     CANStart=xTaskGetTickCount ();
+
+			if(mailBox == canMESSAGE_BOX1 || mailBox == canMESSAGE_BOX21 || mailBox == canMESSAGE_BOX31)
+			{
+
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data); // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+
+					memcpy(&fol_pos[0], &ans, 4);
+					memcpy(&fol_pos[1], &ans2, 4);
+
+
+			}
+
+			if(mailBox == canMESSAGE_BOX2 || mailBox == canMESSAGE_BOX12 || mailBox == canMESSAGE_BOX22 || mailBox == canMESSAGE_BOX32)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&fol_pos[2], &ans, 4);
+					memcpy(&fol_ang_vel_z, &ans2, 4);
+
+
+			}
+
+			if(mailBox == canMESSAGE_BOX3 || mailBox == canMESSAGE_BOX13 || mailBox == canMESSAGE_BOX23 || mailBox == canMESSAGE_BOX33)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&fol_head_error, &ans, 4);
+					memcpy(&fol_lat_error, &ans2, 4);
+
+			}
+
+			if(mailBox == canMESSAGE_BOX4 || mailBox == canMESSAGE_BOX14 || mailBox == canMESSAGE_BOX24 || mailBox == canMESSAGE_BOX34)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&fol_acc_x, &ans, 4);
+					memcpy(&fol_vel, &ans2, 4);
+
+
+			}
+
+			if(mailBox == canMESSAGE_BOX5 || mailBox == canMESSAGE_BOX15 || mailBox == canMESSAGE_BOX25 || mailBox == canMESSAGE_BOX35)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&fol_yaw, &ans, 4);
+					memcpy(&dummy, &ans2, 4);
+//				}
+
+			}
+
+			if(mailBox == canMESSAGE_BOX6 || mailBox == canMESSAGE_BOX16 || mailBox == canMESSAGE_BOX26 || mailBox == canMESSAGE_BOX36)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&lead_vel, &ans, 4);
+					memcpy(&lead_pos[0], &ans2, 4);
+			}
+
+			if(mailBox == canMESSAGE_BOX7 || mailBox == canMESSAGE_BOX17 || mailBox == canMESSAGE_BOX27 || mailBox == canMESSAGE_BOX37)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&lead_pos[1], &ans, 4);
+					memcpy(&lead_pos[2], &ans2, 4);
+					if(lead_pos[2]!=0){
+						straightRoadFlag=0;
+						curveRoadFlag=1;
+
+					}
+					else{
+						straightRoadFlag=1;
+						curveRoadFlag=0;
+					}
+			}
+
+			if(mailBox == canMESSAGE_BOX8 || mailBox == canMESSAGE_BOX18 || mailBox == canMESSAGE_BOX28 || mailBox == canMESSAGE_BOX38)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&lead_vel_delayed, &ans, 4);
+					memcpy(&lead_pos_delayed[0], &ans2, 4);
+
+
+			}
+
+			if(mailBox == canMESSAGE_BOX9 || mailBox == canMESSAGE_BOX19 || mailBox == canMESSAGE_BOX29 || mailBox == canMESSAGE_BOX39)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+
+					//First float value from CAN msg
+					ans = ((rx_data[0]<<24)|(rx_data[1]<<16)|(rx_data[2]<<8)|rx_data[3]);
+					//Second float value from CAN msg
+					ans2 = ((rx_data[4]<<24)|(rx_data[5]<<16)|(rx_data[6]<<8)|rx_data[7]);
+					memcpy(&lead_pos_delayed[1], &ans, 4);
+					memcpy(&lead_pos_delayed[2], &ans2, 4);
+
+					currentTime = xTaskGetTickCount ();
+					timeStep = (currentTime - prevTime)/100000;
+					prevTime = currentTime;
+
+					if(xSemaphoreGive(radarSem) == pdTRUE)
+					{
+						//Can happen if the semaphore is not released from CAN task, but will not
+					}
+
+					if(xSemaphoreGive(uartAccTxSem) == pdTRUE)
+										{
+											//Can happen if the semaphore is not released from CAN task, but will not
+										}
+
+
+
+			}
+
+			if(mailBox == canMESSAGE_BOX10|| mailBox == canMESSAGE_BOX20 || mailBox == canMESSAGE_BOX30 || mailBox == canMESSAGE_BOX40)
+			{
+				while(!canIsRxMessageArrived(canREG1, mailBox));
+				if(canIsRxMessageArrived(canREG1, mailBox))
+				{
+					canGetData(canREG1, mailBox, rx_data);  // Receive Completed
+					ultrasonic_dist = rx_data[0];
+
+					if(xSemaphoreGive(ultrasonicSem) == pdTRUE)
+					{
+						//Can happen if the semaphore is not released from CAN task, but will not
+					}
+				}
+			}
+
+			// 0*8B message for Lane Change Trigger
+
+			if(mailBox == canMESSAGE_BOX11  ){
+					while(!canIsRxMessageArrived(canREG1, mailBox));
+
+					canGetData(canREG1, mailBox, rx_data);
+					laneChangeCount = rx_data[0];
+
+					if(laneChangeCount==0){  // Right Button for Lane Change Trigger
+					laneChangeFlag=1;
+					}
+
+
+					if(laneChangeCount == 246){  // Left Button --> Radar Overrun
+						overrunState0=1;   // For radar to overrun
+						overrunState1=0;   // For CAN to overrun
+
+						V2VDegradeFlag=0;
+						radarDegradeFlag=0;
+						V2VDisableFlag=0;
+						radarDisableFlag=0;
+
+					}
+
+					if(laneChangeCount ==226){   // UP Button --> CAN Overrun
+
+						overrunState0=0; // For radar not to overrun
+						overrunState1=1;   // For CAN to overrun
+
+						V2VDegradeFlag=1;
+						radarDegradeFlag=0;
+						V2VDisableFlag=0;
+						radarDisableFlag=0;
+
+					}
+
+					if(laneChangeCount == 236){  // DOWN Button --- Both radar and CAN overrun
+
+						overrunState0=1; // For radar to overrun
+						overrunState1=1; // For CAN to overrun
+					}
+
+
+					if(overrunState0==1){  // If Radar Overruns
+
+						if(straightRoadFlag==1){
+							V2VDisableFlag=1;
+						}
+						if(curveRoadFlag==1){
+							radarDegradeFlag=1;
+						}
+					}
+
+					if(overrunState1==1){  // If CAN Overruns
+
+						if(straightRoadFlag==1){
+							V2VDegradeFlag=1;
+						}
+						if(curveRoadFlag==1){
+							radarDegradeFlag=1;
+						}
+
+						/* For loop to Simulate Budget Overrun for CAN Task */
+						for(i=0;i<10000;i++){
+							i=i+1;
+							i=i-1;
+						}
+					}
+			}
+
+		//	CANStop=xTaskGetTickCount ();
+		//	CANUtil= CANStop-CANStart;
+
+/*
+
+			CANstopTime = xTaskGetTickCount ();
+			CANexecutionTime[i] = CANstopTime - CANstartTime;
+			Budget += CANexecutionTime[i];
+			i++;
+			if (i == 500)
+			{
+				i = 0;
+				BudgetAvg = Budget/1000;
+				Budget = 0;
+			}
+*/
+		}
+		//1000 is 10 ms. Conversion to x ms = (x/0.01)
+		//TODO: Periodic task works but this does not capture all the incoming data.
+
+	}
+
+	// Simulation of Budget Overrun for CAN task using for loop
+
+}
+
+void CANPeriodicTxTask(void *pvParameters)
+{
+    //For periodicity
+    TickType_t xLastWakeTime;
+
+    xLastWakeTime = xTaskGetTickCount();
+
+  volatile TickType_t CANTxPeriodicstartTime = 0;
+
+  uint8_t test_data[8]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+    int i = 1;
+    static uint8 errorcount[8] = {0,0,0,0,0,0,0,0};
+
+    while(1)
+    {
+    	//CANCritTransmit(canREG1,CANTxMsgSetArr[i].CANMsgBox , test_data);
+    	canTransmit(canREG1,canMESSAGE_BOX63 , errorcount);
+    	gioSetPort(hetPORT1, gioGetPort(hetPORT1) ^ 0x80000021);
+        vTaskDelayUntil(&xLastWakeTime, 2000); //5ms
+    }
+}
+
+void radarTask(void *pvParameters)
+{
+	//For periodicity
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+	int i=0,j=0;
+	while(1)
+	{
+		vTaskDelayUntil(&xLastWakeTime, 2000); //3ms
+
+		if(xSemaphoreTake(radarSem, 0) == pdTRUE)
+		{
+			//RadarstartTime = xTaskGetTickCount ();
+			CANStart=xTaskGetTickCount ();
+			/* Simulate budget overrun */
+			if(overrunState0==1){
+				for(i=0;i<10000;i++)
+					{
+						j=j+1;
+						j=j-1;
+					}
+			}
+
+
+			//Check for radar
+			distApartRadar = calculateEuclidianDistance(fol_pos, lead_pos);
+			vehicleAhead = checkFieldOfView(fol_pos, lead_pos, distApartRadar);
+
+			accelDemand = accelerationDemand2((10-distApartRadar), fol_vel, lead_vel, 0.5);
+			accelerationControl(accelDemand, fol_acc_x);
+			if (vehicleAhead == 1)
+			{
+				send_float(throttle);
+				send_float(steer);
+				send_float(brake);
+				//send_float(gear);
+			}
+
+	/*	else
+			{
+				//TODO? maintain desired speed? accelerate forever?
+				throttle = 2.0/(1.0+exp(fol_vel-20.0));
+				brake = 0;
+				send_float(throttle);
+				send_float(steer);
+				send_float(brake);
+			}
+ */
+
+			if(overrunState0==1){
+
+				throttle = 2.0/(1.0+exp(fol_vel-20.0));
+				brake = 0;
+				send_float(throttle);
+				send_float(steer);
+				send_float(brake);
+				//send_float(gear);
+
+			}
+
+			if(curveRoadFlag ==1 || (straightRoadFlag==1 && overrunState0 == 0) ){
+				if(xSemaphoreGive(vehToVehSem) == pdTRUE)
+					{
+						//Go for v-v task
+					}
+
+			}
+
+		//	 CANStop=xTaskGetTickCount ();
+		//	CANUtil= CANStop-CANStart;
+
+
+
+		}
+	}
+}
+
+
+void vehToVehTask(void *pvParameters)
+{
+
+	/* If  straightRoadFlag =1,
+		 * 		If overrunState0=1; Increase period to 600ms
+		 *		If overrunState1=1; Abort V2V
+		 *
+		 * If  curveRoadFlag =1,
+		 * 		If overrunState0=1; Do nothing
+		 *		If overrunState1=1; Do nothing
+		 *
+		 * */
+
+	//For periodicity
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+
+
+
+	while(1)
+	{
+		vTaskDelayUntil(&xLastWakeTime, 2000); //3ms
+
+		if(xSemaphoreTake(vehToVehSem, 0) == pdTRUE)
+		{
+
+			// CANStart=xTaskGetTickCount ();
+
+
+			//V2VstartTime = xTaskGetTickCount();
+			//Check for v-v
+			distApartVV = calculateEuclidianDistance(fol_pos, lead_pos_delayed);
+			//Acceleration Control
+			if (distApartVV<100 && vehicleAhead != 1)
+						{
+				//TODO? maintain desired speed? accelerate forever?
+
+			accelerationControlVeh(accelDemand, fol_acc_x);
+						}
+
+			//	throttle = 2.5/(1.0+exp(fol_vel-20.0));
+							//	if (distApartVV<130){
+							//	brake = 0.2;
+							//	}
+					if (vehicleAhead != 1)
+					{
+
+								send_float(throttle);
+								send_float(steer);
+								send_float(brake);
+								//send_float(gear);
+
+
+					}
+
+					//  CANStop=xTaskGetTickCount ();
+				//	CANUtil= CANStop-CANStart;
+		}
+
+	}
+}
+
+
+
+
+
+//CA Task :
+
+void CATask(void *pvParameters){
+	//For periodicity
+		TickType_t xLastWakeTime;
+		xLastWakeTime = xTaskGetTickCount();
+		int i=0;
+		while(1)
+		{
+
+
+				vTaskDelayUntil(&xLastWakeTime, 2000); //3ms
+				// CANStart=xTaskGetTickCount ();
+				if (distApartRadar<40)
+				{
+					if(fol_vel > lead_vel){
+						brake = 1;
+						throttle = 0;
+						send_float(throttle);
+						send_float(steer);
+						send_float(brake);
+						//send_float(gear);
+					}
+				}
+
+			/*	if(hillFlag==1){
+					brake =0.1;
+					throttle=0;
+					send_float(throttle);
+					send_float(steer);
+					send_float(brake);
+				}
+			*/
+
+
+			/*	if(distApartRadar>20 && hillFlag==1){
+				brake =0.1;
+				throttle=0;
+				send_float(throttle);
+				send_float(steer);
+				send_float(brake);
+				}
+				else{
+					send_float(throttle);
+					send_float(steer);
+					send_float(brake);
+
+				}
+			*/
+				/*else if(distApartRadar > 20){
+					if(hillFlag==1){
+						if((fol_pos[2]< -0.8) || (fol_pos[2] > 0.8)){
+							brake = 0.2;
+							throttle = 0;
+						}
+					}
+					else{
+						throttle = 2.5/(1.0+exp(fol_vel-20.0));
+
+					}
+				}*/
+
+
+				//  CANStop=xTaskGetTickCount ();
+				//CANUtil= CANStop-CANStart;
+
+		}
+
+}
+
+
+
+//CA Warnings Task :
+
+void CAWarningTask(void *pvParameters)
+{
+	//For periodicity
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+
+    while(1)
+    {
+		if(xSemaphoreTake(uartAccTxSem, 0) == pdTRUE)
+		{
+
+
+
+			if(distApartRadar > 50 ){
+
+				vTaskDelayUntil(&xLastWakeTime, 2000); //9ms
+				//CANStart=xTaskGetTickCount ();
+				/* Collision Warnings */
+		//			gioSetPort(hetPORT1, gioGetPort(hetPORT1) ^ 0x80000021);
+			}
+
+			if((distApartRadar >20) && (distApartRadar<50) ){
+
+							vTaskDelayUntil(&xLastWakeTime, 2000); //9ms
+							CANStart=xTaskGetTickCount ();
+							/* Collision Warnings */
+				//				gioSetPort(hetPORT1, gioGetPort(hetPORT1) ^ 0x80000021);
+			}
+
+
+			// CANStop=xTaskGetTickCount ();
+			// CANUtil= CANStop-CANStart;
+
+
+		}
+    }
+}
+
+
+
+//Ultrasonic Task :
+
+void steerTask(void *pvParameters)
+{
+	//For periodicity
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+	while(1)
+	{
+		vTaskDelayUntil(&xLastWakeTime, 2000); //5ms
+		 CANStart=xTaskGetTickCount ();
+
+		steer = steering(fol_ang_vel_z, fol_head_error, fol_lat_error);
+
+
+
+
+		if(xSemaphoreTake(ultrasonicSem, 0) == pdTRUE)
+		{
+			if (ultrasonic_dist < 10)
+			{
+				/* Lane Change Check -- Car nearby */
+
+			}
+		}
+
+
+
+		  CANStop=xTaskGetTickCount ();
+		CANUtil= CANStop-CANStart;
+	}
+}
+
+//Hill Assist  :
+
+void hillAssistTask(void *pvParameters)
+{
+	//For periodicity
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+	while(1)
+	{
+		vTaskDelayUntil(&xLastWakeTime, 2000); //5ms
+		 CANStart=xTaskGetTickCount ();
+		 gioSetPort(hetPORT1, gioGetPort(hetPORT1) ^ 0x2000000);
+
+		if(fol_pos[2]>0.5){    // Hill Descent Control
+			hillFlag=1;
+			brake =0.2;
+		}
+
+		else if(fol_pos[2] < -0.4){   // Hill Ascent Control
+			hillFlag=1;
+			gear = 1;
+
+			if(fol_vel<0){   // Don't make vehicle to slide back
+				brake =1;
+			}
+
+
+			else if( fol_vel ==0){  // Vehicle stays in slope
+				if(throttle > 0){   // If throttle is applied, move forward
+					brake =0;
+				}
+				else{
+					brake =1;
+				}
+			}
+
+		}
+
+		else{
+			gear =0;
+		}
+
+
+		CANStop=xTaskGetTickCount ();
+		CANUtil= CANStop-CANStart;
+	}
+}
+
+
+
+
+void main(void)
+{
+
+    /* Set high end timer GIO port hetPort pin direction to all output */
+    gioSetDirection(hetPORT1, 0xFFFFFFFF);
+
+	/* UART init */
+	sciInit();
+	sciSetBaudrate(scilinREG, 115200U);
+
+
+	/* Configuring CAN1: MB1, Msg ID-0x82 to recieve from ABS Gateway; MB2, Msg ID-0x81 to recieve from Suspension/OBD Gateway */
+	canInit();
+
+	//printf("Time %f us\n", time_PMU_code);
+	//taskDISABLE_INTERRUPTS();
+	//_disable_interrupt_();
+	vimDisableInterrupt(16);
+
+	canIntRxSem = xSemaphoreCreateBinary();
+	if(NULL == canIntRxSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+	uartAccTxSem = xSemaphoreCreateBinary();
+	if(NULL == uartAccTxSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+	uartUltrasonicTxSem = xSemaphoreCreateBinary();
+	if(NULL == uartUltrasonicTxSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+
+	accSem = xSemaphoreCreateBinary();
+	if(NULL == accSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+
+	ultrasonicSem = xSemaphoreCreateBinary();
+	if(NULL == ultrasonicSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+	radarSem = xSemaphoreCreateBinary();
+	if(NULL == radarSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+	radarSem = xSemaphoreCreateBinary();
+	if(NULL == radarSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+	vehToVehSem = xSemaphoreCreateBinary();
+	if(NULL == vehToVehSem)
+	{
+		/* Failed to create Semaphore */
+		while(1);
+	}
+
+	  /*if (xTaskCreate(laneChangePilotTask,"Lane Change Pilot Task", UART_STACK_SIZE, NULL, 2, &laneChangePilotTcb) != pdTRUE)
+	    {
+
+	        while(1);
+	    }
+*/
+
+
+    if (xTaskCreate(canTask,"CAN Task", configMINIMAL_STACK_SIZE, NULL, 7, &canTaskTcb) != pdTRUE)
+    {
+        /* Task could not be created */
+        while(1);
+    }
+
+    if (xTaskCreate(radarTask,"radar Task", configMINIMAL_STACK_SIZE, NULL, 5, &radarTaskTcb) != pdTRUE)
+    {
+        /* Task could not be created */
+        while(1);
+    }
+
+
+    if (xTaskCreate(steerTask,"steer Task", configMINIMAL_STACK_SIZE, NULL, 6, &ultrasonicTaskTcb) != pdTRUE)
+          {
+              /* Task could not be created */
+              while(1);
+          }
+
+    if (xTaskCreate(vehToVehTask,"Veh to Veh Task", configMINIMAL_STACK_SIZE, NULL, 4, &vehToVehTaskTcb) != pdTRUE)
+    {
+        /* Task could not be created */
+        while(1);
+    }
+
+
+
+        if (xTaskCreate(CAWarningTask,"CA Task", UART_STACK_SIZE, NULL, 2, &CAWarningTaskTcb) != pdTRUE)
+        {
+            /* Task could not be created */
+            while(1);
+        }
+
+        if (xTaskCreate(CATask,"collision avoidance Task", UART_STACK_SIZE, NULL, 3, &CATcb) != pdTRUE)
+              {
+
+            	   /* Task could not be created */
+                   while(1);
+               }
+        if (xTaskCreate(hillAssistTask,"hill Assist Task", configMINIMAL_STACK_SIZE, NULL, 3, &hillAssistTcb) != pdTRUE)
+                 {
+                     /* Task could not be created */
+                     while(1);
+                 }
+
+        if (xTaskCreate(CANPeriodicTxTask,"CANPeriodicTxTask", configMINIMAL_STACK_SIZE , NULL, 3, &CANPeriodicTxTaskTcb) != pdTRUE)
+                {
+                    /* Task could not be created */
+                    while(1);
+                }
+
+    //taskENABLE_INTERRUPTS();
+	//_enable_interrupt_();
+    vimEnableInterrupt(16, SYS_IRQ);
+
+
+
+#if 0
+	_pmuInit_();
+	_pmuEnableCountersGlobal_();
+	_pmuSetCountEvent_(pmuCOUNTER0, PMU_CYCLE_COUNT); // PMU_INST_ARCH_EXECUTED
+
+	_pmuResetCounters_();
+	_pmuStartCounters_(pmuCOUNTER0);
+	cycles_PMU_start = _pmuGetEventCount_(pmuCOUNTER0);
+
+	/* Place the task here to measure the time */
+
+	//for(i = 0 ; i < 100000; i++);
+	for(i = 0 ; i < 10000; i++)
+	{
+		for(j = 0 ; j < 10000; j++);
+	}
+/*
+	for(i = 0 ; i < 10000; i++)
+	{
+		for(j = 0 ; j < 10000; i++);
+	}
+*/
+	_pmuStopCounters_(pmuCOUNTER0);
+	cycles_PMU_end = _pmuGetEventCount_(pmuCOUNTER0);
+	cycles_PMU_measure = cycles_PMU_end - cycles_PMU_start;
+
+	/* Measure the time compensation */
+	_pmuResetCounters_();
+	_pmuStartCounters_(pmuCOUNTER0);
+	cycles_PMU_start = _pmuGetEventCount_(pmuCOUNTER0);
+
+	_pmuStopCounters_(pmuCOUNTER0);
+	cycles_PMU_end = _pmuGetEventCount_(pmuCOUNTER0);
+	cycles_PMU_comp = cycles_PMU_end - cycles_PMU_start;
+
+	/* Calculate Time */
+	cycles_PMU_code = cycles_PMU_measure - cycles_PMU_comp;
+	time_PMU_code = cycles_PMU_code / (f_HCLK); // time_code [us], f_HCLK [MHz]
+	//time_PMU_code = cycles_PMU_code / (f_HCLK * loop_Count_max); //
+#endif
+    /* Start Scheduler */
+    vTaskStartScheduler();
+
+    /* Run forever */
+    while(1);
+/* USER CODE END */
+}
+
+/* can interrupt notification */
+void canMessageNotification(canBASE_t *node, uint32 messageBox)
+{
+
+	//static int sensitivity = 0;
+	//printf("Intrpt\n");
+	if(node == canREG1)
+	{
+		//vimDisableInterrupt(16);
+		mailBox = messageBox;
+
+
+		if(xSemaphoreGiveFromISR(canIntRxSem, NULL) == pdTRUE)
+		{
+
+		}
+
+	}
+}
+
+#if 0
+			while(!canIsRxMessageArrived(canREG1, canMESSAGE_BOX1));
+			canGetData(canREG1, canMESSAGE_BOX1, rx_data); /* Recieve Completed */
+			strncpy(rxMbox1, (char *)rx_data, 4);
+			//printf("Concatenated String %s\n", rxMbox1);
+			rxIntMbox1 = atoi(rxMbox1);
+			//printf("Converted int %d\n", rxIntMbox1);
+			wheelSpin[countbox1++] = rxIntMbox1;
+			if(countbox1 == 4)
+			{
+				countbox1 = 0;
+				antiwheelSlip = calculateWheelSlip(wheelSpin);
+				//printf("Brake Integer %d\n", brake);
+				snprintf((char *)rx_str_data, 5,"%d", antiwheelSlip);
+				//printf("Concatenated Brake String %s\n", rx_str_data);
+				sciSend(UART_ABS, 4, rx_str_data);
+				gioSetPort(hetPORT1, gioGetPort(hetPORT1) ^ 0x00FFF001);/* Toggle HET pin 0.                                    */
+				//vTaskDelay(50);
+			}
+			vimEnableInterrupt(16, SYS_IRQ);
+		}
+
+		if(messageBox == canMESSAGE_BOX2)
+		{
+			vimDisableInterrupt(16);
+			while(!canIsRxMessageArrived(canREG1, canMESSAGE_BOX2));
+			canGetData(canREG1, canMESSAGE_BOX2, rx_data); /* Recieve Completed */
+			strncpy(rxMbox2, (char *)rx_data, 4);
+			rxIntMbox2 = (atoi(rxMbox2));
+			pubSpeed = rxIntMbox2;
+			//if(countbox2 == 4)
+			{
+				//countbox2 = 0;
+				sensitivity = calculateSteerSensitivity(pubSpeed);
+				//printf("Brake Integer %d\n", brake);
+				snprintf((char *)rx_str_data, 5,"%d", sensitivity);
+				//printf("Concatenated Brake String %s\n", rx_str_data);
+				sciSend(UART_STEER, 1, rx_str_data);
+				gioSetPort(hetPORT1, gioGetPort(hetPORT1) ^ 0xA2000000);/* Toggle HET pin 0.                                    */
+				//vTaskDelay(50);
+			}
+			vimEnableInterrupt(16, SYS_IRQ);
+		}
+#endif
+
+
+void send_float (float arg)
+{
+	uint8 header[2] = {'(',')'};
+	uint8 terminator[2] = {'\r','\n'};
+	// get access to the float as a byte-array:
+	uint8 *data = (uint8*)&arg;
+	uint8 *data3 = (uint8*)&arg+3;
+	uint8 *data2 = (uint8*)&arg+2;
+	uint8 *data1 = (uint8*)&arg+1;
+
+	// write the data to the serial (little endian since matlab only reads it this way)
+	//sciSend (scilinREG, 2, &header[0]);
+	sciSend (scilinREG, 1, data3);
+	sciSend (scilinREG, 1, data2);
+	sciSend (scilinREG, 1, data1);
+	sciSend (scilinREG, 1, data);
+	//sciSend (scilinREG, 2, &terminator[0]);
+}
+
+/***********************************Speed Control Start***********************************/
+
+/* Calculate Euclidian Distance between the 2 vehicles */
+float calculateEuclidianDistance(float follower_pos[3], float leader_pos[3])
+{
+	float diff1 = (follower_pos[0]-leader_pos[0])*(follower_pos[0]-leader_pos[0]);
+	float diff2 = (follower_pos[1]-leader_pos[1])*(follower_pos[1]-leader_pos[1]);
+	float diff3 = (follower_pos[2]-leader_pos[2])*(follower_pos[2]-leader_pos[2]);
+	float dist = sqrt(diff1+diff2+diff3);
+
+	return (dist);
+
+}
+
+//Substitute derivative with vel difference btw the 2 vehicles
+//Also means we need to transmit lead vehicle velocity.
+float numericalDerivativeDist(float dist)
+{
+	static float oldDist = 0.0;
+
+	float result = (dist - oldDist)/timeStep;
+	oldDist = dist;
+	return result;
+
+}
+
+float accelerationDemand(float dist, float follower_velX, float headway)
+{
+//	static int i = 0;
+	float headway_vel = headway * follower_velX;
+	float gain = (headway_vel + dist ) * 0.1;
+	float vel = numericalDerivativeDist(dist);
+	float accelDemand = -(gain + vel);
+//	accelRecord[i] = vel;
+//	i++;
+//	if (i == 50)
+//	{
+//		i = 0;
+//	}
+	return accelDemand;
+}
+
+float accelerationDemand2(float dist, float follower_velX, float leader_velX, float headway)
+{
+	static int i = 0;
+	//Calculates the separation wanted btw the 2 vehicles based on follower's current speed
+	float headway_dist = headway * follower_velX;
+	// Separation wanted + Current distance apart
+	float gain = (headway_dist + dist ) * 0.1;
+	// Fraction of total distance apart plus difference in velocity
+	float accelDemand = -(gain + (follower_velX - leader_velX));
+//		accelRecord[i] = xTaskGetTickCount ();
+//		i++;
+//		if (i == 50)
+//		{
+//			i = 0;
+//		}
+	return accelDemand;
+}
+
+void simpleThrottleBrake(float dist, float follower_velX, float leader_velX, float headway)
+{
+	/*float headway_dist = headway * follower_velX;
+	//Simple speed control for low budget
+	if (dist>headway_dist)
+	{
+		throttle = 0.5;
+		brake = 0;
+	}
+	else
+	{
+		brake = 0.5;
+		throttle = 0;
+	}
+	*/
+
+	//Taken from: A Modular Parametric Architecture for the TORCS Racing Engine
+	//Works slight better than the crude method above
+	throttle = 2/(1+exp(follower_velX-leader_velX+2));
+	brake = 0;
+
+
+	//Taken from: Efficieny analysis of formally verifired adaptive cruise controller
+	//Very conservative such that it doesnt keep up on hilly roads
+//	throttle = (sqrt(timeStep*timeStep - 4*follower_velX*timeStep + 8*dist + 4*leader_velX*leader_velX) - timeStep - 2*follower_velX) / 2*timeStep;
+//	brake = (-(follower_velX*follower_velX))/(2*(dist+(leader_velX*leader_velX)/2));
+
+
+
+
+}
+
+int checkFieldOfView(float follower_pos[3], float leader_pos[3], float dist)
+{
+	//67.5 degrees in radians = 1.1781
+	//45 deg in rad = 0.7854
+	float viewAngle = 0.2854;
+	//Range - 50m
+	float x = leader_pos[0]-follower_pos[0];
+	float y = leader_pos[1]-follower_pos[1];
+	float targetAngle = atan2(y,x);
+	float leftBound = fol_yaw + viewAngle;
+	float rightBound = fol_yaw - viewAngle;
+
+	if (targetAngle <= leftBound && targetAngle >= rightBound && dist > 20 && dist <100)
+	{
+
+		return 1;
+	}
+	else
+		return 0;
+
+
+}
+
+/***********************************Speed Control End***********************************/
+
+/***********************************Steering Control Start***********************************/
+
+float numericalDerivativeKP(float kp)
+{
+	static float oldkp = 0.0;
+
+	float result = (kp - oldkp)/timeStep;
+	oldkp = 1.6*kp;
+	return result;
+
+}
+
+float numericalDerivativeKD(float kd)
+{
+	static float oldkd = 0.0;
+
+	float result = (kd - oldkd)/timeStep;
+	oldkd = kd;
+	return result;
+
+}
+
+
+
+
+float laneChangeSteering (float angular_vel, float headingError, float lateralError)
+{
+
+	float kp = 0.08 * headingError;
+	float kd = 1 * lateralError;
+	float k = 0.5 * (angular_vel + kp + kd);
+	float kpDerivative = 0.75 * numericalDerivativeKP(kp);
+	float kdDerivative = 0.25 * numericalDerivativeKD(kd);
+	float gain = 0.5 * (-kpDerivative - kdDerivative -k);
+	float bias = 0.42;
+	float biasStart =0.42;
+	float biasIncrement=0.07;
+	int i=0;
+	const TickType_t xDelay = 20 / portTICK_PERIOD_MS;
+	/*for(i =0;i<7;i++){
+		biasStart = biasStart + biasIncrement;
+		gain = gain + biasStart;
+	}*/
+
+
+
+/*
+	//Need to bound the output for steering
+	if(gain>0.5)
+		return 0.5;
+	else if(gain<(-0.5))
+		return (-0.5);
+	else
+		return gain;*/
+
+
+}
+
+
+
+float steering (float angular_vel, float headingError, float lateralError)
+{
+
+	float kp = 0.08 * headingError;
+	float kd = 1 * lateralError;
+	float k = 0.5 * (angular_vel + kp + kd);
+	float kpDerivative = 0.75 * numericalDerivativeKP(kp);
+	float kdDerivative = 0.25 * numericalDerivativeKD(kd);
+
+
+	float gain = 0.5 * (-kpDerivative - kdDerivative -k);
+
+	if(laneChangeFlag==1){
+		gain = gain-0.5;
+	}
+
+		/*
+		if(laneChangeResolution < 0.42){
+			laneChangeResolution = laneChangeResolution + 0.07;
+			gain = gain + laneChangeResolution;
+		}
+		if(laneChangeResolution > 0.42){
+			laneChangeResolution =0;
+			laneChangeTriggerFlag=2;
+		}*/
+
+
+
+
+
+	//Need to bound the output for steering
+	if(gain>0.5)
+		return 0.5;
+	else if(gain<(-0.5))
+		return (-0.5);
+	else
+		return gain;
+
+
+}
+
+/***********************************Steering Control End***********************************/
+
+/***********************************Acceleration Control Start***********************************/
+
+#define CONSTANT_COMPARATOR -0.1
+
+//requires accel demand
+//Full braking available (RADAR)
+void accelerationControl(float accelDemand, float follower_accelX)
+{
+	float m,c,integral,result;
+	//float timeStep = 0.02;	//x-coordinate
+//	static int i = 0;
+//	static int j = 0;
+//	throttleRecord[i] = accelDemand;
+//	i++;
+//	if (i == 200){
+//		i = 0;
+//	}
+
+	if(accelDemand >= (-0.1))
+	{
+		static float oldGainNsum = 0;	//y-coordinate
+
+		float accelDemandGain = 1.5 * accelDemand;
+		float gainNsum = 10 *(accelDemand - follower_accelX);
+		//integrate?!
+		//Find eqn of line (first point 0,0) Y = mX +C
+		m = (gainNsum-oldGainNsum)/(timeStep);
+		c = gainNsum - (m * timeStep);
+		//func = m*X +C
+		integral =  int_simpson(0.0, gainNsum, 10, m, c);
+		if (integral > 1.0)
+			integral = 1.0;
+		else if (integral < (-1.0))
+			integral = -1.0;
+
+		result = integral+accelDemandGain;
+		oldGainNsum = gainNsum;
+		//return result;
+		throttle = result;
+		brake = 0;
+
+
+	}
+	else
+	{
+		static float oldBrakeGainNsum = 0;
+		float brakeGainNsum = follower_accelX-accelDemand;
+		m = (brakeGainNsum-oldBrakeGainNsum)/(timeStep);
+		c = brakeGainNsum - (m * timeStep);
+		integral =  int_simpson(0.0, brakeGainNsum, 10, m, c);
+		if (integral > 1.0)
+			integral = 1.0;
+		else if (integral < (-1.0))
+			integral = -1.0;
+
+		result = integral+ 0.005 * brakeGainNsum;
+		oldBrakeGainNsum = brakeGainNsum;
+		if (result > 1.0)
+		{
+			//return 1.0;
+			brake = 1.0;
+		}
+
+		else if (result < (0.0))
+		{
+			//return (-1.0);
+			brake = 0;
+		}
+
+		else
+		{
+			//return result;
+			brake = result;
+		}
+		throttle = 0;
+//		accelRecord[j] = brake;
+//		j++;
+//		if (j == 50){
+//			j = 0;
+//		}
+
+	}
+}
+
+//Veh to Veh Comms Control - Brake force limited
+void accelerationControlVeh(float accelDemand, float follower_accelX)
+{
+	float m,c,integral,result;
+	//float timeStep = 0.02;	//x-coordinate
+	static int i = 0;
+//	static int j = 0;
+	throttleRecord[i] = accelDemand;
+	i++;
+	if (i == 200){
+		i = 0;
+	}
+
+	if(accelDemand >= (-0.1))
+	{
+		static float oldGainNsum = 0;	//y-coordinate
+
+		float accelDemandGain = 1.5 * accelDemand;
+		float gainNsum = 10 *(accelDemand - follower_accelX);
+		//integrate?!
+		//Find eqn of line (first point 0,0) Y = mX +C
+		m = (gainNsum-oldGainNsum)/(timeStep);
+		c = gainNsum - (m * timeStep);
+		//func = m*X +C
+		integral =  int_simpson(0.0, gainNsum, 10, m, c);
+		if (integral > 1.0)
+			integral = 1.0;
+		else if (integral < (-1.0))
+			integral = -1.0;
+
+		result = integral+accelDemandGain;
+		oldGainNsum = gainNsum;
+		//return result;
+		throttle = result;
+		brake = 0;
+
+
+	}
+	else
+	{
+		static float oldBrakeGainNsum = 0;
+		float brakeGainNsum = follower_accelX-accelDemand;
+		m = (brakeGainNsum-oldBrakeGainNsum)/(timeStep);
+		c = brakeGainNsum - (m * timeStep);
+		integral =  int_simpson(0.0, brakeGainNsum, 10, m, c);
+		if (integral > 1.0)
+			integral = 1.0;
+		else if (integral < (-1.0))
+			integral = -1.0;
+
+		result = integral+ 0.005 * brakeGainNsum;
+		oldBrakeGainNsum = brakeGainNsum;
+		if (result > 0.2)
+		{
+			//return 1.0;
+			brake = 0.20;
+		}
+
+		else if (result < (-0.5))
+		{
+			//return (-1.0);
+			brake = -0.20;
+		}
+
+		else
+		{
+			//return result;
+			brake = result;
+		}
+		throttle = 0;
+//		accelRecord[j] = brake;
+//		j++;
+//		if (j == 50){
+//			j = 0;
+//		}
+
+	}
+}
+
+double int_simpson(double from, double to, double n, double m, double c)
+{
+   double h = (to - from) / n;
+   double sum1 = 0.0;
+   double sum2 = 0.0;
+   int i;
+
+   for(i = 0;i < n;i++)
+	   //return eqn
+      sum1 += m*(from + h * i + h / 2.0) + c;
+
+   for(i = 1;i < n;i++)
+      sum2 += m * (from + h * i) + c;
+
+   return h / 6.0 * ((m*(from)+c) + (m*(to)+c) + 4.0 * sum1 + 2.0 * sum2);
+}
+
+
+/***********************************Acceleration Control End***********************************/
+
+
+int calculateSteerSensitivity(int pubSpeed)
+{
+	float sensitivity;
+
+	if(pubSpeed < 20)
+		sensitivity = 2;//high sensitivity
+	else
+		sensitivity = 1;//low sensitivity
+
+	return sensitivity;
+}
+
+int calculateWheelSlip(int *wheelSpin)
+{
+	int slip;
+	float wheelradius[4] = {0.330600, 0.330600, 0.327600, 0.327600};
+	int i;
+	for(i = 0; i < 4; i++)
+	{
+		slip += wheelSpin[i] * wheelradius[i];
+	}
+	slip = slip/4;
+	return slip;
+}
