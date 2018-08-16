@@ -94,6 +94,18 @@ float max(float a, float b);
 float prevTime, currentTime;
 float timeStep;
 
+// Track Data for ISA
+static int curve1Start = 225;
+static int curve2Start = 515;
+static int curve3Start = 1160;
+static int curve4Start = 1450;
+
+static int curve1End = 411;
+static int curve2End = 713;
+static int curve3End = 1370;
+static int curve4End = 1656;
+
+
 static float lead_pos[3];
 static float fol_pos[]={179,10,0};
 
