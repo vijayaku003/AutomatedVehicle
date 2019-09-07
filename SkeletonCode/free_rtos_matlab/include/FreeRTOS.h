@@ -505,6 +505,7 @@ extern "C" {
 	#define traceTASK_DELAY_UNTIL()
 #endif
 
+
 #ifndef traceTASK_DELAY
 	#define traceTASK_DELAY()
 #endif
@@ -613,18 +614,41 @@ extern "C" {
 	#define traceQUEUE_REGISTRY_ADD(xQueue, pcQueueName)
 #endif
 
+#ifndef portGET_WCET_CA
+#define portGET_WCET_CA getWCET(0)
+	#endif /* portGET_WCET */
+
+#ifndef portGET_WCET_HA
+#define portGET_WCET_HA getWCET(1)
+	#endif /* portGET_WCET */
+
+
 #ifndef configGENERATE_RUN_TIME_STATS
 	#define configGENERATE_RUN_TIME_STATS 0
 #endif
 
 #if ( configGENERATE_RUN_TIME_STATS == 1 )
 
-	#ifndef portCONFIGURE_TIMER_FOR_RUN_TIME_STATS
+#ifndef portCONFIGURE_TIMER_FOR_RUN_TIME_STATS
 	#define portCONFIGURE_TIMER_FOR_RUN_TIME_STATS() initializeProfiler()
+#endif
+
+
+
+#ifndef portGET_RUN_TIME_COUNTER_VALUE
+#define portGET_RUN_TIME_COUNTER_VALUE getProfilerTimerCount()
+	#endif /* portGET_RUN_TIME_COUNTER_VALUE */
+
+
+
+	#ifndef portCONFIGURE_TIMER_FOR_RUN_TIME_STATS
+		#error If configGENERATE_RUN_TIME_STATS is defined then portCONFIGURE_TIMER_FOR_RUN_TIME_STATS must also be defined.  portCONFIGURE_TIMER_FOR_RUN_TIME_STATS should call a port layer function to setup a peripheral timer/counter that can then be used as the run time counter time base.
 	#endif /* portCONFIGURE_TIMER_FOR_RUN_TIME_STATS */
 
 	#ifndef portGET_RUN_TIME_COUNTER_VALUE
-		#define portGET_RUN_TIME_COUNTER_VALUE getProfilerTimerCount()
+		#ifndef portALT_GET_RUN_TIME_COUNTER_VALUE
+			#error If configGENERATE_RUN_TIME_STATS is defined then either portGET_RUN_TIME_COUNTER_VALUE or portALT_GET_RUN_TIME_COUNTER_VALUE must also be defined.  See the examples provided and the FreeRTOS web site for more information.
+		#endif /* portALT_GET_RUN_TIME_COUNTER_VALUE */
 	#endif /* portGET_RUN_TIME_COUNTER_VALUE */
 
 #endif /* configGENERATE_RUN_TIME_STATS */
@@ -780,6 +804,8 @@ V8 if desired. */
 	#define xListItem ListItem_t
 	#define xList List_t
 #endif /* configENABLE_BACKWARD_COMPATIBILITY */
+
+static int systemState = 0;
 
 #ifdef __cplusplus
 }

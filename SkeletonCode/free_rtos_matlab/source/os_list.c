@@ -230,4 +230,12 @@ List_t * const pxList = ( List_t * ) pxItemToRemove->pvContainer;
 	return pxList->uxNumberOfItems;
 }
 /*-----------------------------------------------------------*/
+void vListIterate( List_t * const pxList, ListItem_t * const pxNewListItem )
+{
+	ListItem_t *pxIterator;
+	const TickType_t xValueOfInsertion = pxNewListItem->xItemValue;
+	for( pxIterator = ( ListItem_t * ) &( pxList->xListEnd ); pxIterator->pxNext->xItemValue <= xValueOfInsertion; pxIterator = pxIterator->pxNext )
+	{
 
+	}
+}

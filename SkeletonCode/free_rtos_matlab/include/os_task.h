@@ -108,6 +108,106 @@ typedef void * TaskHandle_t;
  */
 typedef BaseType_t (*TaskHookFunction_t)( void * );
 
+
+/*
+static uint32_t globalBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0,0,0,0,0,0,0, 9950, 10785, 9950, 9950, 9950, 9950, 9950, 8771, 8771, 17861, 8771, 8771, 8771, 8771, 4618, 4618, 4618, 8432, 4618, 4618, 4618, 162524, 162524, 162524, 154885, 324590, 146534, 162524, 5810, 5810, 5810, 5810, 5810, 10234, 5810, 8153, 8153, 8153, 8153, 8153, 8153, 16532} ;
+static uint32_t globalRuntimeBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0,0,0,0,0,0,0, 9950, 0, 0, 0, 0, 0, 0, 8771, 0, 0, 0, 0, 0, 0, 4618, 0, 0, 0, 0, 0, 0, 162524, 0, 0, 0, 0, 0, 0, 5810, 0, 0, 0, 0, 0, 0, 8153, 0, 0, 0, 0, 0, 0} ;  // {current execution limit, budg_task1_overrun, budg_task2_overrun, budg_task3_overrun}
+static uint32_t globalBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] = {3, 2, 3, 3, 3, 3, 3, 3, 3,2, 3, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 1, 1, 2, 1, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3, 2};
+static uint32_t globalRuntimeBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 0, 0, 0, 0, 0, 0, 0,0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};; // {current behaviour, behaviour due to id of task  overrun
+*/
+
+// All tasks
+/*
+static uint32_t globalBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0,0,0,0,0,0, 8771, 17861, 8771, 8771, 8771, 8771, 4618, 4618, 8432, 4618, 4618, 4618, 162524, 162524, 162524, 324590, 154885, 162524,5810, 5810, 5810, 5810, 10234, 5810, 8153, 8153, 8153, 8153, 8153, 16532};
+static uint32_t globalRuntimeBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0,0,0,0,0,0, 9950, 0, 0, 0, 0, 0, 8771, 0, 0, 0, 0, 0, 4618, 0, 0, 0, 0, 0, 162524, 0, 0, 0, 0, 0, 5810, 0, 0, 0, 0, 0, 8153, 0, 0, 0, 0, 0};
+static uint32_t globalBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 0, 0, 0, 0, 3, 2, 3, 3, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 2, 1, 1, 3, 3, 3, 3, 2, 1, 2, 1, 3, 3, 3, 2};
+static uint32_t globalRuntimeBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; // {current behaviour, behaviour due to id of task  overrun
+*/
+
+// Three tasks
+
+
+//static uint32_t globalBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 0, 0, 4618, 8432, 4618, 4618, 162524, 154885, 324590, 146534, 5810, 5810, 5810, 10234};
+//static uint32_t globalBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 0, 0, 3, 2, 3, 3, 3, 1, 2, 1, 3, 3, 3, 2};
+//static uint32_t globalRuntimeBudgetTable[configNumberOfTasks+1][1] = {0, 4618, 162524, 5810};
+
+
+// For all tasks:
+static uint32_t globalBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] =  {0, 0, 0, 0, 0, 0, 4618, 300000, 4618, 4618, 4618, 4618, 162524, 154885, 524590, 146534, 162524, 162524, 5810, 5810, 5810, 600234, 5810, 5810, 8771, 8771, 8771, 8771, 307861, 8771, 8153, 8153, 8153, 8153, 8153, 16532};
+static uint32_t globalBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 0, 0, 0, 0, 3, 2, 3, 3, 3, 3, 3, 1,  2, 1, 3, 3, 3,  3,  3,  2,  3,  3, 3, 3, 3, 3,  3,  3, 3, 3, 3,  3, 3,  3};
+static uint32_t globalRuntimeBudgetTable[configNumberOfTasks+1][1] =  {0, 0, 0, 0, 0, 0};
+
+
+
+static int PID = 1;
+static int ONOFF = 0;
+static int ISA = 0;
+
+static int maxSCExecutionTime =0;
+static int maxCCExecutionTime =0;
+static int maxCAExecutionTime =0;
+static int maxRadarExecutionTime =0;
+static int maxV2VExecutionTime =0;
+
+
+/*static uint32_t globalBudgetTable[configNumberOfTasks+1][configNumberOfTasks+1] = {0, 0, 4618, 10000};
+static uint32_t globalBehaviourTable[configNumberOfTasks+1][configNumberOfTasks+1] =  {0, 0, 3, 2};
+static uint32_t globalRuntimeBudgetTable[configNumberOfTasks+1][1] = {0,4618};*/
+
+
+static int scCurrentBehaviour = 0;
+static int ccCurrentBehaviour = 0;
+static int caCurrentBehaviour = 0;
+static int radarCurrentBehaviour = 0;
+static int v2vCurrentBehaviour = 0;
+
+static int scCurrentExecutionLimit = 0;
+static int caCurrentExecutionLimit = 0;
+static int ccCurrentExecutionLimit = 0;
+static int radarCurrentExecutionLimit = 0;
+static int v2vCurrentExecutionLimit=0;
+
+static int budgetOverrunDetected = 0;
+static int updaingSameCriticality = 0;
+static int updatingDifferentCriticality = 0;
+
+static int scNormalBudget;
+static int scSafeBudget;
+static int scBudgetforCCOverrun;
+static int scBudgetforCAOverrun;
+static int scBudgetforRadarOverrun;
+static int scBudgetforV2VOverrun;
+
+static int ccNormalBudget;
+static int ccBudgetforSCOverrun;
+static int ccSafeBudget;
+static int ccBudgetforCAOverrun;
+static int ccBudgetforRadarOverrun;
+static int ccBudgetforV2VOverrun;
+
+static int caNormalBudget;
+static int caBudgetforSCOverrun;
+static int caBudgetforCCOverrun;
+static int caSafeBudget;
+static int caBudgetforRadarOverrun;
+static int caBudgetforV2VOverrun;
+
+
+static int radarNormalBudget;
+static int radarBudgetforSCOverrun;
+static int radarBudgetforCCOverrun;
+static int radarSafeBudget;
+static int radarBudgetforCAOverrun;
+static int radarBudgetforV2VOverrun;
+
+static int v2vNormalBudget;
+static int v2vBudgetforSCOverrun;
+static int v2vBudgetforCCOverrun;
+static int v2vBudgetforCAOverrun;
+static int v2vBudgetforRadarOverrun;
+static int v2vSafeBudget;
+
+
 /* Task states returned by eTaskGetState. */
 typedef enum
 {

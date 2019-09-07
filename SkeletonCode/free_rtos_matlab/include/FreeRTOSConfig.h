@@ -91,7 +91,7 @@
 #define configUSE_PREEMPTION		  1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION	1
 #define configUSE_FPU							1
-#define configUSE_IDLE_HOOK			  0
+#define configUSE_IDLE_HOOK			  1
 #define configUSE_TICK_HOOK			  0
 #define configUSE_TRACE_FACILITY	  1
 #define configUSE_16_BIT_TICKS		  0
@@ -102,9 +102,12 @@
 #define configTOTAL_HEAP_SIZE		  ( ( size_t ) 8192 )
 #define configMAX_TASK_NAME_LEN		  ( 16 )
 #define configIDLE_SHOULD_YIELD		  0
-#define configGENERATE_RUN_TIME_STATS 0
+#define configGENERATE_RUN_TIME_STATS 1
 #define configUSE_MALLOC_FAILED_HOOK  0
 
+#define configNumberOfTasks  5 // Steer, CA, CC
+//#define configParametersToBeStored  7
+#define configNumberOfCriticalityLevels		4
 
 
 /* Co-routine definitions. */
